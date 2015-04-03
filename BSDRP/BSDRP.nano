@@ -460,6 +460,9 @@ add_port "benchmarks/iperf"
 #add_port "emulators/open-vm-tools" "-DWITHOUT_X11 -DWITHOUT_LIBNOTIFY -DWITHOUT_FUSE -DWITHOUT_ICU"
 #add_port "emulators/virtualbox-ose-additions/" "-DWITHOUT_X11 -DWITHOUT_HAL"
 
+# Add nano
+add_port "editors/nano"
+
 #### End of port list section ####
 
 # Add netrate tools

@@ -183,6 +183,7 @@ usage () {
 		echo " -r   use a memory disk as destination dir" 
 		echo " -y   Answer yes to all confirmation"
 		echo " -w   suppress buildworld"
+		echo " -g   use GPT partition table type"
 	) 1>&2
 	exit 2
 }
@@ -223,7 +224,9 @@ UPDATE_SRC=false
 UPDATE_PORT=false
 # Boolean for using TMPFS
 TMPFS=false
-args=`getopt a:bc:dfhkp:s:uryw $*`
+# Partition type
+PARTITION_TYPE="mbr"
+args=`getopt a:bc:dfhkp:s:urywg $*`
 
 set -- $args
 for i
@@ -288,6 +291,10 @@ do
 			;;
 		-w)
 			SKIP_REBUILD="-w -n"
+			shift
+			;;
+		-g)
+			PARTITION_TYPE="gpt"
 			shift
 			;;
 		--)
@@ -548,6 +555,9 @@ case ${INPUT_CONSOLE} in
 		echo "customize_cmd bsdrp_console_serial" >> /tmp/${PROJECT}.nano
 		;;
 esac
+
+echo "# Partition type" >> /tmp/${PROJECT}.nano
+echo "PARTITION_TYPE=\"${PARTITION_TYPE}\"" >> /tmp/${PROJECT}.nano
 
 # Delete the destination dir
 if [ -z "${SKIP_REBUILD}" ]; then

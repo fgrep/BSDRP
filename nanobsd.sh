@@ -663,9 +663,152 @@ create_i386_diskimage ( ) (
 	) > ${NANO_OBJ}/_.di 2>&1
 )
 
+create_i386_diskimage_gpt ( ) (
+	pprint 2 "build gpt diskimage"
+	pprint 3 "log: ${NANO_OBJ}/_.di"
+
+	(
+	NANO_BOOTLOADER="boot/pmbr"
+	NANO_GPTBOOT="boot/gptboot"
+	IMG=${NANO_DISKIMGDIR}/${NANO_IMGNAME}
+	MNT=${NANO_OBJ}/_.mnt
+	mkdir -p ${MNT}
+
+	if [ "${NANO_MD_BACKING}" = "swap" ] ; then
+		MD=`mdconfig -a -t swap -s ${NANO_MEDIASIZE} -x ${NANO_SECTS} \
+			-y ${NANO_HEADS}`
+	else
+		echo "Creating md backing file..."
+		rm -f ${IMG}
+		dd if=/dev/zero of=${IMG} seek=${NANO_MEDIASIZE} count=0
+		MD=`mdconfig -a -t vnode -f ${IMG} -x ${NANO_SECTS} \
+			-y ${NANO_HEADS}`
+	fi
+
+	echo $NANO_MEDIASIZE $NANO_IMAGES \
+		$NANO_SECTS $NANO_HEADS \
+		$NANO_CODESIZE $NANO_CONFSIZE $NANO_DATASIZE $MD |
+	awk '
+	{
+		printf "# %s\n", $0
+
+		# Size of disk
+		dsk = int (($1 / 2) / 1024)
+
+		if ($7 > 0) {
+			# size of data partition
+			dsl = int($7 / 1024)
+		} else {
+			dsl = 0;
+		}
+
+		# size of config partition
+		csl = int ($6 / 1024)
+
+		if ($5 == 0) {
+			# size of image partition(s)
+			isl = int ((dsk - dsl - csl - 2) / $2)
+		} else {
+			isl = int ($5 / 1024)
+		}
+
+		# Create GPT partition table
+		print "gpart create -s gpt", $8
+
+		# GPT boot
+		print "gpart add -t freebsd-boot -b 34 -s ", 1024, $8
+
+		# First image partition
+		print "gpart add -t freebsd-ufs -b 1M -s ", isl"M", $8
+
+		# Second image partition 
+		if ($2 > 1) {
+			print "gpart add -t freebsd-ufs -s ", isl"M", $8
+		}
+
+		# Config partition
+		print "gpart add -t freebsd-ufs -s ", csl"M", $8
+
+		# Data partition (if any)
+		if ($7 > 0) {
+			print "gpart add -t freebsd-ufs -s ", dsl"M", $8
+		}
+
+		# Force slice 1 to be marked active. This is necessary
+		# for booting the image from a USB device to work.
+		print "gpart set -a bootme -i 2 ", $8
+	}
+	' > ${NANO_OBJ}/_.gpart
+
+	trap "echo 'Running exit trap code' ; df -i ${MNT} ; nano_umount ${MNT} || true ; mdconfig -d -u $MD" 1 2 15 EXIT
+
+	sh ${NANO_OBJ}/_.gpart
+	gpart show ${MD}
+	fdisk ${MD}
+	# XXX: params
+	# XXX: pick up cached boot* files, they may not be in image anymore.
+	if [ -f ${NANO_WORLDDIR}/${NANO_BOOTLOADER} -a -f ${NANO_WORLDDIR}/${NANO_GPTBOOT} ]; then
+		gpart bootcode -b ${NANO_WORLDDIR}/${NANO_BOOTLOADER} -p ${NANO_WORLDDIR}/${NANO_GPTBOOT} -i 1 ${MD}
+	fi
+
+	# Create first image
+	populate_slice /dev/${MD}p2 ${NANO_WORLDDIR} ${MNT} "s1a"
+
+	generate_mtree /dev/${MD}p2 ${MNT}
+
+	if [ $NANO_IMAGES -gt 1 -a $NANO_INIT_IMG2 -gt 0 ] ; then
+		# Duplicate to second image (if present)
+		echo "Duplicating to second image..."
+		dd conv=sparse if=/dev/${MD}p2 of=/dev/${MD}p3 bs=64k
+		mount /dev/${MD}p3 ${MNT}
+		for f in ${MNT}/etc/fstab ${MNT}/conf/base/etc/fstab
+		do
+			sed -i "" "s=${NANO_DRIVE}s1=${NANO_DRIVE}s2=g" $f
+		done
+		nano_umount ${MNT}
+		# Override the label from the first partition so we
+		# don't confuse glabel with duplicates.
+		if [ ! -z ${NANO_LABEL} ]; then
+			tunefs -L ${NANO_LABEL}"s2a" /dev/${MD}p3
+		fi
+	fi
+	
+	# Create Config slice
+	populate_cfg_slice /dev/${MD}p4 "${NANO_CFGDIR}" ${MNT} "s3"
+
+	# Create Data slice, if any.
+	if [ $NANO_DATASIZE -ne 0 ] ; then
+		populate_data_slice /dev/${MD}p5 "${NANO_DATADIR}" ${MNT} "s4"
+	fi
+
+	if [ "${NANO_MD_BACKING}" = "swap" ] ; then
+		if [ ${NANO_IMAGE_MBRONLY} ]; then
+			echo "Writing out _.disk.mbr..."
+			dd if=/dev/${MD} of=${NANO_DISKIMGDIR}/_.disk.gpt bs=512 count=1
+		else
+			echo "Writing out ${NANO_IMGNAME}..."
+			dd conv=sparse if=/dev/${MD} of=${IMG} bs=64k
+		fi
+	fi
+
+	if ${do_copyout_partition} ; then
+		echo "Writing out _.disk.image..."
+		dd conv=sparse if=/dev/${MD}p2 of=${NANO_DISKIMGDIR}/_.disk.image bs=64k
+	fi
+	mdconfig -d -u $MD
+
+	trap - 1 2 15
+	trap nano_cleanup EXIT
+
+	) > ${NANO_OBJ}/_.di 2>&1
+)
+
 # i386 and amd64 are identical for disk images
 create_amd64_diskimage ( ) (
 	create_i386_diskimage
+)
+create_amd64_diskimage_gpt ( ) (
+	create_i386_diskimage_gpt
 )
 
 # This function need to be adapted to the new nanobsd !!
@@ -1424,7 +1567,15 @@ setup_nanobsd
 prune_usr
 run_late_customize
 if $do_image ; then
-	create_${NANO_ARCH}_diskimage
+	if [ "${NANO_ARCH}" = "i386" -o "${NANO_ARCH}" = "amd64" ]; then
+		if [ "${PARTITION_TYPE}" = "gpt" ]; then
+			create_${NANO_ARCH}_diskimage_gpt
+		else
+			create_${NANO_ARCH}_diskimage
+		fi
+	else
+		create_${NANO_ARCH}_diskimage
+	fi
 else
 	pprint 2 "Skipping image build (as instructed)"
 fi

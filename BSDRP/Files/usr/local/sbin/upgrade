@@ -40,11 +40,11 @@
 
 # Strict script
 set -eu
-
+set -x 
 # Variables
 ARCH=`uname -m`
 
-#Load the NANO_DRIVE (label) variable:
+# Load the NANO_DRIVE (label) variable:
 . /etc/nanobsd.conf
 
 LABEL=`cut -d '/' -f 2 /etc/nanobsd.conf`
@@ -55,13 +55,13 @@ die() { echo -n "EXIT: " >&2; echo "$@" >&2; exit 1; }
 # Get Label information for MBR
 mbr_get_info() {
 	if mount | grep -q "/dev/${NANO_DRIVE}s1a on / "; then 
-    	DST_SLICE="s2"
-    	SRC_SLICE="s1"
+		DST_SLICE="s2"
+		SRC_SLICE="s1"
 	elif mount | grep -q "/dev/${NANO_DRIVE}s2a on / " ; then                
-    	DST_SLICE="s1"
-    	SRC_SLICE="s2"
+		DST_SLICE="s1"
+		SRC_SLICE="s2"
 	else
-    	die "Can't detect active slice"
+		die "Can't detect active slice"
 	fi
 
 	DST_LABEL="${LABEL}${DST_SLICE}a"
@@ -70,24 +70,32 @@ mbr_get_info() {
 
 	# ufs/BSDRPs1a     N/A  aacd0s1a
 	boot_dev=/dev/`glabel status | grep ${SRC_LABEL} | awk '{ print $3; }'\
-       	| cut -d s -f 1`
+       	| cut -d s -f 1 | cut -d p -f 1` 
 
+	# Check if using GPT
+	part_type=`gpart show ${boot_dev} | grep '=>' | awk '{ print $5; }'`
+	if [ "${part_type}" = "GPT" ]; then
+		DST_SLICE=`echo ${DST_SLICE} | sed 's/s1/p2/'`
+		DST_SLICE=`echo ${DST_SLICE} | sed 's/s2/p3/'`
+		SRC_SLICE=`echo ${SRC_SLICE} | sed 's/s1/p2/'`
+		SRC_SLICE=`echo ${SRC_SLICE} | sed 's/s2/p3/'`
+	fi
 }
 
 # Get label information for Sun VTOC
 vtoc_get_info() {
 	if mount | grep -q "/dev/${NANO_DRIVE}s1a on / "; then 
-    	DST_SLICE="d"
+    		DST_SLICE="d"
 		DST_LABEL="${LABEL}s2a"
-    	SRC_SLICE="a"
+    		SRC_SLICE="a"
 		SRC_LABEL="${LABEL}s1a"
 	elif mount | grep -q "/dev/${NANO_DRIVE}s2a on / " ; then                
-    	DST_SLICE="a"
+		DST_SLICE="a"
 		DST_LABEL="${LABEL}s1a"
-    	SRC_SLICE="d"
+		SRC_SLICE="d"
 		SRC_LABEL="${LABEL}s2a"
 	else
-    	die "Can't detect active slice"
+		die "Can't detect active slice"
 	fi
 	BSD_SLICE=""
 	# ufs/BSDRPs1a     N/A  ada1a
@@ -105,13 +113,18 @@ write_new_image() {
 	dd of=${boot_dev}${DST_SLICE} obs=64k || \
 		die "ERROR: Can't install the upgrade on ${boot_dev}${DST_SLICE}"
 
-	# Check that it worked
-	fsck_ffs -n ${boot_dev}${DST_SLICE}${BSD_SLICE} || \
-		die "ERROR: New file system ${boot_dev}${DST_SLICE}${BSD_SLICE} check failed"
-
-	# Set Label into the new slice
-	tunefs -L ${DST_LABEL} ${boot_dev}${DST_SLICE}${BSD_SLICE} || \
-		die "ERROR: Can't put label on the new filesystem"
+	# Check that it worked and set label into the new slice
+	if [ "${part_type}" = "GPT" ]; then
+		fsck_ffs -n ${boot_dev}${DST_SLICE} || \
+			die "ERROR: New file system ${boot_dev}${DST_SLICE}${BSD_SLICE} check failed"
+		tunefs -L ${DST_LABEL} ${boot_dev}${DST_SLICE} || \
+			die "ERROR: Can't put label on the new filesystem"	
+	else
+		fsck_ffs -n ${boot_dev}${DST_SLICE}${BSD_SLICE} || \
+			die "ERROR: New file system ${boot_dev}${DST_SLICE}${BSD_SLICE} check failed"
+		tunefs -L ${DST_LABEL} ${boot_dev}${DST_SLICE}${BSD_SLICE} || \
+			die "ERROR: Can't put label on the new filesystem"
+	fi
 
 	# Need to tune some files on the new partition
 	[ -d /tmp/sysupgrade ] || mkdir /tmp/sysupgrade
@@ -163,12 +176,19 @@ write_new_image() {
 }
 
 x86_boot_modif () {
-	# Change the default selection of the boot manager
-    boot0cfg -s `echo ${DST_SLICE} | cut -d 's' -f 2` -t 18 -v ${boot_dev} || \
-        die "ERROR: Can't update FreeBSD bootloader"
-	# Change the active partition
-	gpart set -a active -i `echo ${DST_SLICE} | cut -d 's' -f 2` ${boot_dev} || \
-		die "ERROR: Can't update active partition"
+	if [ "${part_type}" = "GPT" ]; then
+		gpart set -a bootme -i `echo ${DST_SLICE} | cut -d 'p' -f 2` ${boot_dev} || \
+			die "ERROR: Can't update active partition"
+		gpart unset -a bootme -i `echo ${SRC_SLICE} | cut -d 'p' -f 2` ${boot_dev} || \
+			die "ERROR: Can't update active partition"
+	else
+		# Change the default selection of the boot manager
+		boot0cfg -s `echo ${DST_SLICE} | cut -d 's' -f 2` -t 18 -v ${boot_dev} || \
+			die "ERROR: Can't update FreeBSD bootloader"
+		# Change the active partition
+		gpart set -a active -i `echo ${DST_SLICE} | cut -d 's' -f 2` ${boot_dev} || \
+			die "ERROR: Can't update active partition"
+	fi
 }
 
 arm_boot_modif () {
@@ -196,23 +216,23 @@ vtoc_boot_modif () {
 
 case "${ARCH}" in
         i386|amd64)
-			mbr_get_info
-			write_new_image
+		mbr_get_info
+		write_new_image
 	    	x86_boot_modif
             ;;
         arm)
-			echo "WARNING: This script was never tested on ARM"
-			mbr_get_info
-			write_new_image
-            arm_boot_modif
+		echo "WARNING: This script was never tested on ARM"
+		mbr_get_info
+		write_new_image
+		arm_boot_modif
             ;;
         sparc64)
-			vtoc_get_info
-			write_new_image
-            vtoc_boot_modif
+		vtoc_get_info
+		write_new_image
+		vtoc_boot_modif
             ;;
         *)
-            die "Unsupported arch!"
+		die "Unsupported arch!"
 esac
 
 # Log
